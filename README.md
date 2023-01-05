@@ -34,7 +34,7 @@ and a categorical variable describing the magnitude of landslide occurrence, whe
 
 ### 01_sitkafrequentistmodels.R 
 
-Fits the frequentist logistic and Poisson regression models and calculates AIC and BIC
+Fits the frequentist logistic and Poisson regression models, creates manual leave-one-out models for validation; calculates AIC and BIC
 
 ### 02_sitkabayesianmodels.Rmd 
 
