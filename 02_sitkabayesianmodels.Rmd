@@ -1,0 +1,853 @@
+---
+title: "Sitka Bayesian Models"
+author: "Lisa Luna"
+date: "1/24/2022"
+output: html_document
+---
+
+This notebook uses the R package brms to fit Bayesian logistic and Poisson regression models (models BL-XXXX and BP-XXXX, Table 1, main text).  It also compares models using different cumulative precipitation time scales with the Leave One Out Information Criterion (LOOIC), implemented with the loo package.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+
+library(brms)
+library(tidybayes)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(loo)
+library(bayesplot)
+library(patchwork)
+library(boot)
+library(dplyr)
+library(scales)
+
+dat <- read.csv('id_logit_220309.csv')
+
+figdir <- '../03_Figures/20220922_Figures/'
+
+dat <- dat[complete.cases(dat),] #must remove NANs so that LOO will work to compare models (needs same number of data points for all models)
+
+
+
+```
+
+Standardize predictors so that they have a mean of 0 and a standard deviation of 1 (z-score)
+
+```{r}
+scaled.dat <- dat %>% mutate_at(c("precip_mm_day", "precip_mm_maxhr","precip_mm_max3hr","precip_mm_max6hr","precip_mm_max12hr","precip_mm_7day","precip_mm_3day","precip_mm_2day","precip_mm_14day","precip_mm_24hr","precip_mm_day_shift","precip_mm_2day_shift","precip_mm_3day_shift","precip_mm_7day_shift","precip_mm_14day_shift"), ~scale(.) %>% as.vector)
+```
+
+### Logistic Regression ### 
+
+Steps: 
+- Define priors
+- Prior predictive checks
+- Fit models
+- Extract draws and plot posterior parameter estimates
+- Model comparison with LOO
+
+Next, we select a prior.  We need to set priors on two parameters, the intercept (b0), and the coefficient of standardized precipitation (b1).  
+
+At mean precipitation (standardized precipitation = 0), the intercept (b0) defines the probability of landsliding (p = inv.logit(b0). At mean precipitation, we would expect less than a 50% chance of landsliding (b0 = 0), so there should be more weight on negative values of b0, but we'll use a weakly informative prior that also allows positive values (which would mean that there were a greater than 50% chance of landsliding at mean precipitation and we'd be having landslides quite often).  We choose a Student-t distribution with 3 degrees of freedom, location of -3, and scale of 2.5.
+
+We also expect that the probability of landsliding should increase with increasing precipitation intensity.  This implies a positive value for b1.  We therefore choose a prior that puts more weight on positive values of b1, but again, is weakly informative and does not exclude negative values, just in case the data are showing us that landslide probability decreases with increasing precipitation (which would be very surprising).  We choose a Student-t distribution with 3 degrees of freedom, location of -3, and scale of 2.5.
+
+Next, we perform a prior predictive check.  Here, we simulate values from our prior distributions and plot them to make sure that they make sense.  
+
+```{r}
+N <- 100 #how many values to draw from the prior?
+b0 = rstudent_t(N, 3, -3, 2.5) # draw values from prior distribution for b0
+b1 = rstudent_t(N, 3, 3, 2.5) #draw values from prior distribution for b1
+x = seq(-10,10,0.1) #x represents a standardized precipitation value
+
+
+#plots
+hist(b0, main = "b0 prior")
+hist(b1, main = "b1 prior")
+
+
+plot(NULL, 
+     xlim = range(x), 
+     ylim = c(0,1), 
+     xlab = 'standardized precip', 
+     ylab = 'p(landslide)', 
+     main = 'Prior predictive check')
+
+for (i in 1:N) curve(inv.logit(b0[i] + b1[i] * x), 
+                     add = TRUE, 
+                     col = alpha("black", alpha = 0.2))
+
+
+
+```
+
+Indeed, we see that more lines are increasing with increasing precipitation than decreasing, and that at mean precipitation, the probability of landsliding is often less than 0.5. But, we also see that we admit many other values, so we won't exclude anything within the realm of possibility if the data show these results. 
+
+
+```{r}
+#define priors for brms 
+
+logst_priors <- c(prior(student_t(3, 3, 2.5), class = "b"), #coefficient of standardized precip
+                  prior(student_t(3, -3, 2.5), class = "Intercept")) #intercept
+
+```
+
+Now, let's view the raw data before we fit models
+
+```{r}
+ggplot(dat, 
+       aes(x=precip_mm_max3hr, 
+           y = precip_mm_day_shift, 
+           color = event)) + 
+  geom_point(alpha = 0.5)
+
+
+```
+
+
+Fit logistic regression models with the maximum 1h, 3h, 6h, 24h rainfall falling on a day and 2-day, 3-day, 7-day, and 14-day including the day of the landslide as the single predictor.  We do not include antecedent precipitation in these models.
+
+```{r, warn=FALSE, message=FALSE}
+
+intensity <- c("precip_mm_maxhr", "precip_mm_max3hr", "precip_mm_max6hr", "precip_mm_max12hr", "precip_mm_24hr", "precip_mm_2day","precip_mm_3day","precip_mm_7day", "precip_mm_14day")
+
+intensity_logst_fits <- list()
+
+for (i in intensity) {
+  
+  f <- as.formula(paste("event ~ ", i))
+
+  intensity_logst_fits[[i]] <- brm(formula = f, 
+                     data = scaled.dat, 
+                     family = bernoulli(link = "logit"), 
+                     prior = logst_priors,
+                     warmup = 500, 
+                     iter = 2000, 
+                     chains = 4, 
+                     cores = 4)  
+ 
+  }
+
+```
+
+
+Fit logistic regression models with the maximum 1h, 3h, 6h, 24h rainfall falling on a day and the antecedent day, 2 days, 3 days, 7 days, and 14 days as predictors. 
+
+```{r, warn=FALSE, message=FALSE}
+
+ante <- c("precip_mm_day_shift", "precip_mm_2day_shift", "precip_mm_3day_shift", "precip_mm_7day_shift", "precip_mm_14day_shift")
+
+subday_intensity <- c("precip_mm_maxhr", "precip_mm_max3hr", "precip_mm_max6hr", "precip_mm_max12hr", "precip_mm_24hr")
+
+intensity_ante_logst_fits <- list()
+
+for (i in subday_intensity) {
+
+  ante_fits <- list()
+  
+  for (a in ante) {
+    
+  #f <- as.formula(paste("event ~ ", i, " + ", a)) #no interaction
+  f <- as.formula(paste0("event ~ ", i, " + ", a, " + ", i, ":", a))
+
+  ante_fits[[a]] <- brm(formula = f, 
+                     data = scaled.dat, 
+                     family = bernoulli(link = "logit"), 
+                     prior = logst_priors,
+                     warmup = 500, 
+                     iter = 2000, 
+                     chains = 4, 
+                     cores = 4)  
+ 
+  }
+  
+  intensity_ante_logst_fits[[i]] <- ante_fits
+  
+}
+  
+```
+
+
+```{r}
+#save fits to file 
+
+# saveRDS(object = intensity_logst_fits, file = "intensity_logst_fits.RDS")
+# saveRDS(object = intensity_ante_logst_fits, file = "intensity_ante_logst_fits.RDS")
+```
+
+
+Check that the traces look good (they should look like fuzzy caterpillars, and they do)
+```{r}
+
+mcmc_plot(intensity_logst_fits$precip_mm_maxhr, type = "trace")
+mcmc_plot(intensity_logst_fits$precip_mm_max3hr, type = "trace")
+mcmc_plot(intensity_logst_fits$precip_mm_max6hr, type = "trace")
+mcmc_plot(intensity_logst_fits$precip_mm_max12hr, type = "trace")
+mcmc_plot(intensity_logst_fits$precip_mm_24hr, type = "trace")
+
+```
+Check that they chains converged (Rhat should be close to 1)
+
+```{r}
+plot(rhat(intensity_logst_fits$precip_mm_maxhr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_logst_fits$precip_mm_max3hr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_logst_fits$precip_mm_max6hr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_logst_fits$precip_mm_max12hr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_logst_fits$precip_mm_24hr)); abline(h = 1.01, lty = 2, col = "red")
+
+```
+
+```{r}
+#two ways to view the posterior parameter estimates
+
+summary(intensity_logst_fits$precip_mm_max3hr)
+
+
+mcmc_plot(intensity_logst_fits$precip_mm_max3hr, 
+          type = "areas", 
+          prob = 0.95)
+
+```
+
+
+Extract posterior parameter estimates at range of precip values and transform from standardized to measured scale.
+
+```{r}
+
+epred_logst_df <- data.frame()
+
+for (n in names(intensity_logst_fits)) {
+
+a <- scaled.dat[n]
+a <- a[!is.na(a)] #remove nans
+b <- dat[[n]]
+b <- b[!is.na(b)] #remove nans
+
+newdata <- data.frame(x = seq(from = min(a), to = max(a), length.out = 100))
+colnames(newdata) <- n
+
+epred_temp <- newdata  %>%
+  
+                  add_epred_draws(intensity_logst_fits[[n]], ndraws = 500) %>%
+                  
+                  mutate_at(n, ~(.*sd(b) + mean(b))) %>%
+              
+                  mutate(time = n) %>%
+                
+                  rename(precip_mm = n)
+
+epred_logst_df <- bind_rows(epred_logst_df, epred_temp)
+
+}
+
+
+epred_logst_df[epred_logst_df == "precip_mm_14day"] <- "14-Day Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_7day"] <- "7-Day Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_3day"] <- "3-Day Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_2day"] <- "2-Day Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_24hr"] <- "1-Day Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_max12hr"] <- "12-Hour Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_max6hr"] <- "6-Hour Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_max3hr"] <- "3-Hour Precipitation (mm)"
+epred_logst_df[epred_logst_df == "precip_mm_maxhr"] <- "Hourly Precipitation (mm)"
+
+```
+
+```{r}
+#what's the epred at the thresholds? 
+
+epred.logst.3h <- epred_logst_df %>% filter(time == "Max 3-Hour Precip (mm)")
+
+nearlowthresh <- epred.logst.3h %>% filter(.epred > 0.0099 & .epred < 0.0101)
+
+hdinearlowthresh <- nearlowthresh$precip_mm %>% median_hdi()
+
+
+nearhighthresh <- epred.logst.3h %>% filter(.epred > 0.69 & .epred < 0.71)
+
+hdinearhighthresh <- nearhighthresh$precip_mm %>% median_hdi()
+
+
+
+
+b <- dat[['precip_mm_max3hr']]
+b <- b[!is.na(b)] #remove nans
+
+
+lowestls <- tibble(precip_mm_max3hr = c(23.368, 22.860)) %>%
+                  mutate(precip_mm_max3hr = (precip_mm_max3hr - mean(b))/sd(b))
+
+epred_lowestls <- lowestls  %>%
+  
+                  add_epred_draws(intensity_logst_fits[['precip_mm_max3hr']]) %>%
+                  
+                  mutate_at('precip_mm_max3hr', ~(.*sd(b) + mean(b))) %>%
+        
+                  median_hdi(.width = c(0.50, 0.66, 0.95))
+
+
+```
+
+
+
+
+```{r}
+#tidy up data so we can plot it
+
+dat_minimal <- dat[c("event","precip_mm_maxhr","precip_mm_max3hr","precip_mm_max6hr", "precip_mm_max12hr", "precip_mm_24hr", "precip_mm_2day", "precip_mm_3day", "precip_mm_7day", "precip_mm_14day")]
+
+event_tidy <- pivot_longer(dat_minimal, 
+                           cols = 2:10,
+                           names_to = "time", 
+                           values_to = "precip_mm")
+
+
+event_tidy[event_tidy == "precip_mm_14day"] <- "14-Day Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_7day"] <- "7-Day Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_3day"] <- "3-Day Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_2day"] <- "2-Day Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_24hr"] <- "1-Day Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_max12hr"] <- "12-Hour Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_max6hr"] <- "6-Hour Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_max3hr"] <- "3-Hour Precipitation (mm)"
+event_tidy[event_tidy == "precip_mm_maxhr"] <- "Hourly Precipitation (mm)"
+
+```
+
+Make Figure 4.
+
+```{r}
+ord <-  c("Hourly Precipitation (mm)","3-Hour Precipitation (mm)","6-Hour Precipitation (mm)", "12-Hour Precipitation (mm)", "1-Day Precipitation (mm)", "2-Day Precipitation (mm)", "3-Day Precipitation (mm)", "7-Day Precipitation (mm)", 
+          "14-Day Precipitation (mm)")
+
+
+fig_post_logst <-  epred_logst_df %>%
+        
+                ggplot(aes(x = precip_mm, y = event)) + 
+                
+                stat_lineribbon(aes(y=.epred), point_interval = median_qi, 
+                                .width = c(0.85, 0.95), size = 0.5, color = 'red') + 
+                
+                scale_fill_brewer(palette = "Purples") +
+                
+                geom_point(data = event_tidy %>% filter(event == 1), pch=21,bg="red",size=1.5) + 
+  
+                geom_point(data = event_tidy %>% filter(event == 0), size = 1.5, alpha = 0.7) +
+                
+                facet_wrap(~factor(time, levels = ord), nrow = 3, scales = "free_x") + 
+  
+                ylab("Landslide Probability") +
+  
+                xlab("Precipitation (mm)") + 
+                
+                theme_bw() + 
+  
+                theme(panel.grid.minor.y = element_blank(),
+                      legend.position = "none", 
+                      strip.background = element_rect(fill = NA, color = NA))
+  
+plot(fig_post_logst)
+
+
+ggsave(filename = paste0(figdir, 'logistic_posteriors.png'),
+       plot = fig_post_logst,
+       #device = pdf,
+       width = 150,
+       height = 120,
+       units = 'mm', 
+       dpi = 400)
+
+
+ggsave(filename = paste0(figdir, 'logistic_posteriors.pdf'),
+       plot = fig_post_logst,
+       #device = pdf,
+       width = 150,
+       height = 120,
+       units = 'mm')
+
+rm(fig_post_logst)
+
+```
+LOOIC
+
+Compare models - use leave one out cross validation to estimate out of sample predictive accuracy.
+
+```{r}
+#trigger-only LOO
+
+intensity_logst_loo <- lapply(intensity_logst_fits, loo, cores = 4)
+
+lc_logst <- loo_compare(intensity_logst_loo)
+
+print(lc_logst, simplify = FALSE)
+```
+
+```{r}
+
+labels <- character(25)
+
+count <- 1
+
+for (i in 1:length(names(intensity_ante_logst_fits))) {
+  
+  for (j in 1:length(names(intensity_ante_logst_fits[[1]]))) {
+  
+  
+  labels[count] <- paste0(names(intensity_ante_logst_fits[i]), names(intensity_ante_logst_fits[[i]])[j])
+  
+  count <- count + 1
+  
+  }
+  
+}
+  
+
+
+```
+
+```{r}
+#trigger-antecedent LOO
+
+ante_logst_loo <- list()
+
+for (a in names(intensity_ante_logst_fits)) {
+  
+  temp <- lapply(intensity_ante_logst_fits[[a]], loo, cores = 4)
+  
+  ante_logst_loo <- append(ante_logst_loo, temp)
+  
+}
+
+names(ante_logst_loo) <- labels
+
+lc_logst_ante <- loo_compare(ante_logst_loo)
+
+#LOO for all
+
+lc_logst_all <- loo_compare(append(intensity_logst_loo, ante_logst_loo))
+
+
+print(lc_logst_all, simplify = FALSE)
+
+```
+
+```{r}
+#write output of LOO compare to csv
+write.csv(lc_logst_all, file = paste0(figdir, "loocompare_logst.csv"))
+
+```
+
+```{r}
+save(list = c("intensity_logst_fits", "intensity_ante_logst_fits"), file = paste0(figdir, "logst_fits.Rdata"))
+
+fit_logst_3h <- intensity_logst_fits$precip_mm_max3hr #reassign 3h to another variable name to work with further
+
+rm(intensity_logst_fits, intensity_ante_logst_fits, ante_fits, ante_logst_loo, epred_logst_df, epred_temp, intensity_logst_loo, lc_logst, lc_logst_all, lc_logst_ante, temp, dat_minimal, event_tidy, 
+   newdata)
+
+```
+
+### Poisson Regression ###
+
+Steps:
+- Define priors
+- Prior predictive checks
+- Fit models
+- Extract draws and plot posterior parameter estimates
+- Model comparison with LOO
+
+Next, we select a prior.  We need to set priors on two parameters, the intercept (b0), and the coefficient of standardized precipitation (b1).
+
+At mean precipitation (standardized precipitation = 0), the intercept (b0) defines the average rate of landsliding (landslides/day) (lambda = exp(b0)). At mean precipitation, we would expect less than a 1 landslide per day on average (b0 = 0), so there should be more weight on negative values of b0, but we'll use a weakly informative prior that also allows positive values (which would mean that we would see 1 landslide per day on average at mean precipitation and we'd be having landslides quite often).  We choose a Student-t distribution with 3 degrees of freedom, location of -5, and scale of 1.
+
+We also expect that we would see more landslides with increasing precipitation intensity. This implies a positive value for b1.  We therefore choose a prior that puts more weight on positive values of b1, but again, is weakly informative and does not exclude negative values, just in case the data are showing us that we get fewer landslides with increasing precipitation (which would be very surprising).  We choose a Student-t distribution with 3 degrees of freedom, location of 0.5, and scale of 1.
+
+```{r}
+
+N <- 100
+
+x = seq(-10,10,0.1) #x represents a standardized precipitation value
+b0 = rstudent_t(N, 3, -5, 1) # draw values from prior distribution for b0
+b1 = rstudent_t(N, 3, 0.5, 1) #draw values from prior distribution for b1
+
+
+hist(b0, main = "b0 prior")
+
+hist(b1, main = "b1 prior")
+
+```
+Next, we perform a prior predictive check.  Here, we simulate values from our prior distributions and plot them to make sure that they make sense.
+
+```{r}
+
+plot(NULL,
+     xlim = range(x),
+     ylim = c(0,20),
+     xlab = 'standardized precip',
+     ylab = 'Average rate of landsliding (landslides/day)',
+     main = 'Prior predictive check')
+
+for (i in 1:N) curve(exp(b0[i] + b1[i] * x),
+                     add = TRUE,
+                     col = alpha("black", alpha = 0.2))
+
+
+
+```
+
+Indeed, we see that more lines are increasing with increasing precipitation than decreasing, and that at mean precipitation, the average number of landslides per day is far below 1. But, we also see that we admit many other values, so we won't exclude anything within the realm of possibility if the data show these results.
+
+
+```{r}
+#define priors for brms
+
+pois_priors <- c(prior(student_t(3, -5, 1), class = "b"), #coefficient of standardized precip
+                  prior(student_t(3, 0.5, 1), class = "Intercept")) #intercept
+
+```
+
+
+
+Fit poisson regression models with the maximum 1h, 3h, 6h, 24h rainfall falling on a day and 2-day, 3-day, 7-day, and 14-day including the day of the landslide as the single predictor.
+
+```{r, warn=FALSE, message=FALSE}
+
+intensity <- c("precip_mm_maxhr", "precip_mm_max3hr", "precip_mm_max6hr", "precip_mm_max12hr", "precip_mm_24hr", "precip_mm_2day","precip_mm_3day","precip_mm_7day", "precip_mm_14day")
+
+intensity_pois_fits <- list()
+
+for (i in intensity) {
+
+  f <- as.formula(paste("lscount ~ ", i))
+  
+  print(f)
+
+  intensity_pois_fits[[i]] <- brm(formula = f,
+                     data = scaled.dat,
+                     family = poisson(link = "log"),
+                     prior = pois_priors,
+                     warmup = 500,
+                     iter = 2000,
+                     chains = 4,
+                     cores = 4)
+
+  }
+
+#ran ok, no errors, no divergences
+```
+
+Fit Poisson regression models with the maximum 1h, 3h, 6h, 24h rainfall falling on a day and the antecedent day, 2 days, 3 days, 7 days, and 14 days as predictors.
+
+```{r, warn=FALSE, message=FALSE}
+
+ante <- c("precip_mm_day_shift", "precip_mm_2day_shift", "precip_mm_3day_shift", "precip_mm_7day_shift", "precip_mm_14day_shift")
+
+subday_intensity <- c("precip_mm_maxhr", "precip_mm_max3hr", "precip_mm_max6hr", "precip_mm_max12hr", "precip_mm_24hr")
+
+intensity_ante_pois_fits <- list()
+
+for (i in subday_intensity) {
+
+  ante_fits <- list()
+
+  for (a in ante) {
+
+  f <- as.formula(paste("lscount ~ ", i, " + ", a))
+  
+  print(f)
+
+  ante_fits[[a]] <- brm(formula = f,
+                     data = scaled.dat,
+                     family = poisson(link = "log"),
+                     prior = pois_priors,
+                     warmup = 500,
+                     iter = 2000,
+                     chains = 4,
+                     cores = 4)
+
+  }
+
+  intensity_ante_pois_fits[[i]] <- ante_fits
+
+}
+
+#ran fine, no warnings, no divergences
+
+```
+
+
+Check that the traces look good (they should look like fuzzy caterpillars, and they do)
+```{r}
+
+mcmc_plot(intensity_pois_fits$precip_mm_maxhr, type = "trace")
+mcmc_plot(intensity_pois_fits$precip_mm_max3hr, type = "trace")
+mcmc_plot(intensity_pois_fits$precip_mm_max6hr, type = "trace")
+mcmc_plot(intensity_pois_fits$precip_mm_24hr, type = "trace")
+
+```
+Check that they chains converged (Rhat should be close to 1)
+
+```{r}
+plot(rhat(intensity_pois_fits$precip_mm_maxhr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_pois_fits$precip_mm_max3hr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_pois_fits$precip_mm_max6hr)); abline(h = 1.01, lty = 2, col = "red")
+plot(rhat(intensity_pois_fits$precip_mm_24hr)); abline(h = 1.01, lty = 2, col = "red")
+
+```
+
+```{r}
+#two ways to view the posterior parameter estimates
+
+summary(intensity_pois_fits$precip_mm_max3hr)
+
+
+mcmc_plot(intensity_pois_fits$precip_mm_max3hr,
+          type = "areas",
+          prob = 0.95)
+
+```
+
+Extract expectations of the posterior predictive distribution at range of precip values and transform from standardized to measured scale.
+
+
+```{r}
+
+epred_pois_df <- data.frame()
+
+for (n in names(intensity_pois_fits)) {
+
+a <- scaled.dat[n]
+b <- dat[[n]]
+
+newdata <- data.frame(x = seq(from = min(a), to = max(a), length.out = 100))
+colnames(newdata) <- n
+
+epred_temp <- newdata  %>%
+
+                  add_epred_draws(intensity_pois_fits[[n]], ndraws = 500) %>%
+
+                  #add_predicted_draws(intensity_pois_fits[[n]]) %>%
+
+                  mutate_at(n, ~(.*sd(b) + mean(b))) %>%
+
+                  mutate(time = n) %>%
+
+                  rename(precip_mm = n)
+
+epred_pois_df <- bind_rows(epred_pois_df, epred_temp)
+
+}
+
+epred_pois_df[epred_pois_df == "precip_mm_14day"] <- "14-Day Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_7day"] <- "7-Day Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_3day"] <- "3-Day Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_2day"] <- "2-Day Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_24hr"] <- "1-Day Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_max12hr"] <- "12-Hour Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_max6hr"] <- "6-Hour Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_max3hr"] <- "3-Hour Precipitation (mm)"
+epred_pois_df[epred_pois_df == "precip_mm_maxhr"] <- "Hourly Precipitation (mm)"
+
+
+```
+
+
+
+```{r}
+#average predicted counts at threshold
+
+b <- dat[['precip_mm_max3hr']]
+b <- b[!is.na(b)] #remove nans
+
+
+threshprecip <- tibble(precip_mm_max3hr = c(21.3, 34.0)) %>%
+                  mutate(precip_mm_max3hr = (precip_mm_max3hr - mean(b))/sd(b))
+
+epred_pois_thresh <- threshprecip  %>%
+  
+                  add_epred_draws(intensity_pois_fits[['precip_mm_max3hr']]) %>%
+                  
+                  mutate_at('precip_mm_max3hr', ~(.*sd(b) + mean(b))) %>%
+        
+                  median_hdi(.width = c(0.50, 0.66, 0.95))
+
+epred_temp <- threshprecip  %>%
+
+                  add_epred_draws(intensity_pois_fits[['precip_mm_max3hr']], ndraws = 500) %>%
+
+                  #add_predicted_draws(intensity_pois_fits[[n]]) %>%
+
+                  mutate_at('precip_mm_max3hr', ~(.*sd(b) + mean(b)))
+
+
+
+
+```
+
+
+
+
+
+```{r}
+#tidy up data so we can plot it
+
+dat_minimal_pois <- dat[c("lscount","precip_mm_maxhr","precip_mm_max3hr","precip_mm_max6hr", "precip_mm_max12hr", "precip_mm_24hr", "precip_mm_2day", "precip_mm_3day", "precip_mm_7day", "precip_mm_14day")]
+
+lscount_tidy <- pivot_longer(dat_minimal_pois,
+                           cols = 2:10,
+                           names_to = "time",
+                           values_to = "precip_mm")
+
+lscount_tidy[lscount_tidy == "precip_mm_14day"] <- "14-Day Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_7day"] <- "7-Day Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_3day"] <- "3-Day Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_2day"] <- "2-Day Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_24hr"] <- "1-Day Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_max12hr"] <- "12-Hour Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_max6hr"] <- "6-Hour Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_max3hr"] <- "3-Hour Precipitation (mm)"
+lscount_tidy[lscount_tidy == "precip_mm_maxhr"] <- "Hourly Precipitation (mm)"
+
+
+
+```
+
+Make Figure 6
+
+```{r}
+ord <-  c("Hourly Precipitation (mm)","3-Hour Precipitation (mm)","6-Hour Precipitation (mm)", "12-Hour Precipitation (mm)", "1-Day Precipitation (mm)", "2-Day Precipitation (mm)", "3-Day Precipitation (mm)", "7-Day Precipitation (mm)", 
+          "14-Day Precipitation (mm)")
+
+
+fig_post_pois <-  epred_pois_df %>%
+        
+                ggplot(aes(x = precip_mm, y = lscount)) + 
+                
+                stat_lineribbon(aes(y=.epred), point_interval = median_qi, 
+                                .width = c(0.85, 0.95), size = 0.5, color = 'red') + 
+                
+                scale_fill_brewer(palette = "Purples") +
+                
+                geom_point(data = lscount_tidy %>% filter(lscount > 0), pch=21,bg="red",size=1.5) + 
+  
+                geom_point(data = lscount_tidy %>% filter(lscount == 0), size = 1.5, alpha = 0.7) +
+                
+                facet_wrap(~factor(time, levels = ord), nrow = 3, scales = "free_x") + 
+  
+                ylab("Expected Number of Landslides") +
+  
+                xlab("Precipitation (mm)") + 
+              
+                coord_cartesian(ylim = c(0,10)) +  
+                
+                theme_bw() + 
+  
+                theme(panel.grid.minor.y = element_blank(),
+                      legend.position = "none", 
+                      strip.background = element_rect(fill = NA, color = NA), 
+                      axis.title.x = element_blank())
+  
+plot(fig_post_pois)
+
+
+ggsave(filename = paste0(figdir, 'poisson_posteriors.png'),
+       plot = fig_post_pois,
+       #device = pdf,
+       width = 150,
+       height = 100,
+       units = 'mm', 
+       dpi = 400)
+
+
+ggsave(filename = paste0(figdir, 'poisson_posteriors.pdf'),
+       plot = fig_post_pois,
+       #device = pdf,
+       width = 150,
+       height = 120,
+       units = 'mm')
+
+rm(fig_post_pois)
+
+```
+
+Comparing models - use leave one out cross validation to estimate out of sample predictive performance.
+
+
+```{r}
+
+intensity_pois_loo <- lapply(intensity_pois_fits, loo, cores = 4)
+
+lc_pois <- loo_compare(intensity_pois_loo)
+
+print(lc_pois, simplify = FALSE)
+```
+
+```{r}
+
+labels <- character(25)
+
+count <- 1
+
+for (i in 1:length(names(intensity_ante_pois_fits))) {
+
+  for (j in 1:length(names(intensity_ante_pois_fits[[1]]))) {
+
+
+  labels[count] <- paste0(names(intensity_ante_pois_fits[i]), names(intensity_ante_pois_fits[[i]])[j])
+
+  count <- count + 1
+
+  }
+
+}
+
+
+
+```
+
+```{r}
+
+ante_pois_loo <- list()
+
+for (a in names(intensity_ante_pois_fits)) {
+
+  temp <- lapply(intensity_ante_pois_fits[[a]], loo, cores = 4)
+
+  ante_pois_loo <- append(ante_pois_loo, temp)
+
+}
+
+names(ante_pois_loo) <- labels
+
+lc_pois_ante <- loo_compare(ante_pois_loo)
+
+lc_pois_all <- loo_compare(append(intensity_pois_loo, ante_pois_loo))
+
+
+print(lc_pois_all, simplify = FALSE)
+
+```
+
+
+
+```{r}
+write.csv(lc_pois_all, file = "../03_Figures/loocompare_pois.csv")
+```
+
+
+```{r}
+save(list = c("intensity_pois_fits", "intensity_ante_pois_fits"), file = paste0(figdir, "pois_fits.Rdata"))
+
+fit_pois_3h <- intensity_pois_fits$precip_mm_max3hr #reassign 3h to another variable name to work with further
+
+rm(intensity_pois_fits, intensity_ante_pois_fits, ante_fits, ante_pois_loo, epred_pois_df, epred_temp, intensity_pois_loo, lc_pois, lc_pois_all, lc_pois_ante, temp, dat_minimal_pois, event_tidy_pois, 
+   newdata)
+```
+
+
+

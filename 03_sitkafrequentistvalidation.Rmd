@@ -1,0 +1,589 @@
+---
+title: "Sitka Frequentist Model Validation"
+author: "Lisa Luna"
+date: "2/1/2022"
+output: html_document
+---
+
+This notebook performs validation steps for the 3-hourly frequentist models: FL-3H and FP-3H. It: 
+- performs manual leave-one-out cross validation for the landslide points
+- splits the data series into training and test
+- creates confusion matrices
+- calculates Brier Skill Scores 
+- calculates and plots precision-recall curves 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(patchwork)
+library(forcats)
+library(ROCit)
+library(tidyr)
+library(cutpointr)
+library(scico)
+
+```
+
+```{r}
+
+#set a directory to save the figures in 
+
+figdir <- '../03_Figures/20221219_Figures/'
+
+#read the landslide data
+id.logit <- read.csv('../01_Data/id_logit_220309.csv')
+
+#where are the landslides in the data table?
+
+lsdat <- id.logit[id.logit$event == 1, ]
+
+#add a note which drop this corresponds to
+
+lsdat <- bind_cols(lsdat, data.frame(model = as.factor(c("loo1", "loo2", "loo3", "loo4", "loo5"))))
+
+#make this a factor and reorder it by maximum 3 hour precipitation 
+
+lsdat <- lsdat %>%
+         mutate(model = fct_rev(reorder(model, precip_mm_max3hr)))
+
+```
+
+
+Get the 3 hour logistic fits for further validation 
+
+```{r}
+
+fit.logst.3h <- glm(data=id.logit,event~precip_mm_max3hr,family=binomial())
+
+summary(fit.logst.3h)$coefficients[,'Std. Error']
+
+```
+
+
+Leave one out cross validation of the logistic models
+
+```{r}
+#run the models excluding one landslide point each time
+
+#max 3 hr rainfall occurring on that day as predictor
+
+landloo_logst_fits <- list()
+
+for (i in 1:nrow(lsdat)) {
+  
+  landloo_logst_fits[[i]] <- glm(data = id.logit[id.logit$day != lsdat[i, 'day'],], 
+                     event~precip_mm_max3hr,family=binomial()) 
+ 
+  }
+
+names(landloo_logst_fits) <- c("loo1", "loo2", "loo3", "loo4", "loo5")
+
+
+
+```
+
+
+```{r}
+#get parameter estimates and 95% confidence intervals for each model 
+
+#estimating 95% confidence intervals based on standard error * 1.96
+landloo_logst_params <- data.frame(summary(fit.logst.3h)$coefficients) %>%
+                         mutate(low95 = Estimate - Std..Error*1.96) %>%
+                        mutate(upper95 = Estimate + Std..Error*1.96)
+  
+landloo_logst_params <- landloo_logst_params %>% 
+                        mutate(param = row.names(landloo_logst_params), 
+                               model = 'all') 
+
+
+for (n in names(landloo_logst_fits)) {
+  
+model <- landloo_logst_fits[[n]]
+  
+temp <- data.frame(summary(model)$coefficients) %>%
+                         mutate(low95 = Estimate - Std..Error*1.96) %>%
+                        mutate(upper95 = Estimate + Std..Error*1.96)
+
+temp <- temp %>% 
+              mutate(param = row.names(temp), 
+                               model = n) 
+
+landloo_logst_params <- bind_rows(landloo_logst_params, temp)
+
+}
+
+
+landloo_logst_params[landloo_logst_params == "(Intercept)"] <- 'beta0'
+landloo_logst_params[landloo_logst_params == "precip_mm_max3hr"] <- 'beta1'
+
+
+```
+
+
+
+```{r}
+
+plot.logst.params <- ggplot(data = landloo_logst_params %>%
+                              mutate(model = factor(model, 
+                                                 levels = levels(lsdat$model))),
+                             aes(y = model, 
+                             x = Estimate, 
+                             xmin = low95, 
+                             xmax = upper95)) + 
+                              geom_pointrange(fatten = 0.7, size = 0.5) + 
+                              facet_wrap(~param, scales = 'free_x') +
+                              theme_bw() + 
+                              theme(panel.background = element_rect(fill = NA, color = 'black'),
+                             strip.text = element_blank(),
+                              axis.title.x = element_blank(),
+                              axis.title.y = element_blank(),
+                              axis.text.y = element_blank(), 
+                              axis.ticks.y = element_blank()) 
+
+plot.logst.params
+
+
+ggsave(filename = paste0(figdir, 'logreg_param_forestplot.pdf'),
+        plot = plot.logst.params,
+       width = 3.7,
+       height = 1,
+       units = ('in'))
+```
+
+
+Get the 3 hour Poisson fits for further validation 
+
+```{r}
+
+fit.pois.3h <- glm(data=id.logit,lscount~precip_mm_max3hr,family=poisson())
+
+```
+
+
+Leave one out cross validation of the poisson models
+
+```{r}
+#run the models excluding one landslide point each time
+
+#max 3 hr rainfall occurring on that day as predictor
+
+landloo_pois_fits <- list()
+
+for (i in 1:nrow(lsdat)) {
+  
+  landloo_pois_fits[[i]] <- glm(data = id.logit[id.logit$day != lsdat[i, 'day'],], 
+                     lscount~precip_mm_max3hr,family=poisson()) 
+ 
+  }
+
+names(landloo_pois_fits) <- c("loo1", "loo2", "loo3", "loo4", "loo5")
+
+
+
+```
+
+
+```{r}
+#get parameter estimates and 95% confidence intervals for each model 
+
+#estimating 95% confidence intervals based on standard error * 1.96
+landloo_pois_params <- data.frame(summary(fit.pois.3h)$coefficients) %>%
+                         mutate(low95 = Estimate - Std..Error*1.96) %>%
+                        mutate(upper95 = Estimate + Std..Error*1.96)
+  
+landloo_pois_params <- landloo_pois_params %>% 
+                        mutate(param = row.names(landloo_pois_params), 
+                               model = 'all') 
+
+
+for (n in names(landloo_pois_fits)) {
+  
+model <- landloo_pois_fits[[n]]
+  
+temp <- data.frame(summary(model)$coefficients) %>%
+                         mutate(low95 = Estimate - Std..Error*1.96) %>%
+                        mutate(upper95 = Estimate + Std..Error*1.96)
+
+temp <- temp %>% 
+              mutate(param = row.names(temp), 
+                               model = n) 
+
+landloo_pois_params <- bind_rows(landloo_pois_params, temp)
+
+}
+
+
+landloo_pois_params[landloo_pois_params == "(Intercept)"] <- 'alpha0'
+landloo_pois_params[landloo_pois_params == "precip_mm_max3hr"] <- 'alpha1'
+
+
+```
+
+
+
+```{r}
+
+plot.pois.params <- ggplot(data = landloo_pois_params %>%
+                              mutate(model = factor(model, 
+                                                 levels = levels(lsdat$model))),
+                             aes(y = model, 
+                             x = Estimate, 
+                             xmin = low95, 
+                             xmax = upper95)) + 
+                              geom_pointrange(fatten = 0.7, size = 0.5) + 
+                              facet_wrap(~param, scales = 'free_x') + 
+                              theme_bw() + 
+                              theme(panel.background = element_rect(fill = NA, color = 'black'),
+                             strip.text = element_blank(),
+                              axis.title.x = element_blank(),
+                              axis.title.y = element_blank(),
+                              axis.text.y = element_blank(), 
+                              axis.ticks.y = element_blank()) 
+
+plot.pois.params
+
+
+ggsave(filename = paste0(figdir, 'pois_param_forestplot.pdf'),
+        plot = plot.pois.params,
+       width = 3.7,
+       height = 1,
+       units = ('in'))
+```
+
+
+### Confusion Matrix ### 
+
+With certain thresholds in place and all days on record, how often would we have issued which warnings, and how often would they have been correct? 
+
+In this case, we are evaluating the performance of the model based on training data to understand how often warnings would have been issued in the past.  This, however, does not indicate how well the model might be able to predict landslides in the future.  For that, we'll split the data into a training and testing dataset in the next step. 
+
+Get predicted values from the model fits for all days in the past 
+
+```{r}
+
+pred.logst.3h.all <- predict(fit.logst.3h, 
+                              newdata = data.frame(precip_mm_max3hr = id.logit[, "precip_mm_max3hr"]), 
+                              type = 'response', 
+                             se.fit = TRUE)
+
+
+pred.logst.3h.all <- data.frame(day = id.logit[, "day"],
+                                event = id.logit[, "event"],
+                                precip_mm_max3hr = id.logit[, "precip_mm_max3hr"], 
+                                prediction = pred.logst.3h.all) %>% 
+                                filter(!is.na(precip_mm_max3hr)) #remove days with no precip info
+
+```
+
+
+
+
+```{r}
+
+# threshold between lowest warning level and medium warning level 
+
+tl <- 0.01 # 1% probability of a landslide on this day
+  
+# threshold between medium warning level and highest warning level
+
+tu <- 0.7 # 70% probability of a landslide on this day
+
+# days with a low warning level = 1
+pred.logst.3h.all$low <- as.integer(pred.logst.3h.all$prediction.fit <= tl)
+
+
+# days with a medium warning level = 1
+pred.logst.3h.all$med <- as.integer(pred.logst.3h.all$prediction.fit > tl & pred.logst.3h.all$prediction.fit <= tu)
+
+
+# days with a high warning level = 1
+pred.logst.3h.all$high <- as.integer(pred.logst.3h.all$prediction.fit > tu)
+
+```
+
+
+```{r}
+#initiate confusion matrix data frame 
+
+conf.mat.all <- data.frame(row.names = c("landslide", "no landslide"))
+
+#add data 
+conf.mat.all["landslide", "low"] <- pred.logst.3h.all %>% filter(event == 1) %>% pull(low) %>% sum
+conf.mat.all["no landslide", "low"] <- pred.logst.3h.all %>% filter(event == 0) %>% pull(low) %>% sum
+conf.mat.all["landslide", "med"] <- pred.logst.3h.all %>% filter(event == 1) %>% pull(med) %>% sum
+conf.mat.all["no landslide", "med"] <- pred.logst.3h.all %>% filter(event == 0) %>% pull(med) %>% sum
+conf.mat.all["landslide", "high"] <- pred.logst.3h.all %>% filter(event == 1) %>% pull(high) %>% sum
+conf.mat.all["no landslide", "high"] <- pred.logst.3h.all %>% filter(event == 0) %>% pull(high) %>% sum
+
+write.csv(conf.mat.all, paste0(figdir, "confmat_all.csv"))
+
+conf.mat.all
+```
+
+
+```{r}
+#calculate precision and recall 
+
+#precision (TP/TP+FP) %of correctly identified landslide days out of all predicted landslide days
+precision.all <- sum(conf.mat.all["landslide", c("med", "high")])/sum(conf.mat.all[,c("med", "high")])
+
+#recall(TP/TP+FN) % of correctly identified landslides days out of all landslide days 
+recall.all <- sum(conf.mat.all["landslide", c("med", "high")])/sum(conf.mat.all["landslide",])
+
+print(precision.all)
+print(recall.all)
+
+```
+
+### Confusion matrix and Brier Skill Score for training and testing data ### 
+
+Now, we'll evaluate the model's ability to predict landslides in the future by splitting the time series into training data and test data. We will train the model on data from November 2002 to November 2019, and test on the data from December 2019 - December 2020.  We note that 3 landslides occurred in the training timeframe and 2 landslides during the testing timeframe. 
+
+###### Confusion Matrix ######
+
+```{r}
+#split time series into training and test
+
+id.logit.train <- id.logit[id.logit$day < '2019-12-01',] #train on Nov 2002 through Nov 2019
+id.logit.test <- id.logit[(id.logit$day > '2019-12-01') & (id.logit$day < '2020-12-01'),] #test on Dec 2019 through Nov 2020
+
+#fit model to training data 
+fit.logst.3h.train <- glm(data=id.logit.train,event~precip_mm_max3hr,family=binomial())
+
+
+#get the predicted landslide probability for each day in the test time series on logit scale
+
+pred.logst.3h.test.link <- predict(fit.logst.3h.train, 
+                              newdata = data.frame(precip_mm_max3hr = id.logit.test[, "precip_mm_max3hr"]), 
+                              type = 'link', 
+                              se.fit = TRUE)
+
+
+pred.logst.3h.test.link <- data.frame(day = id.logit.test[, "day"],
+                                event = id.logit.test[, "event"],
+                                precip_mm_max3hr = id.logit.test[, "precip_mm_max3hr"], 
+                                pred.link.fit = pred.logst.3h.test.link$fit,
+                                pred.link.se.fit = pred.logst.3h.test.link$se.fit) %>% 
+                                filter(!is.na(precip_mm_max3hr)) #remove days with no precip info
+
+#run prediction and standard error confidence interval estimate through inverse link function
+
+fam <-family(fit.logst.3h.train)
+ilink <- fam$linkinv
+
+pred.logst.3h.test <- pred.logst.3h.test.link %>% 
+                      mutate(prediction.fit = ilink(pred.link.fit),
+                             upper95 = ilink(pred.link.fit + pred.link.se.fit*1.96), 
+                             lower95 = ilink(pred.link.fit - pred.link.se.fit*1.96))
+
+#where lower confidence bound is negative, set to a tiny positive value to be able to plot on a log scale
+pred.logst.3h.test[pred.logst.3h.test$lower95<=0, "lower95"] <- 1e-7
+
+```
+
+
+
+```{r}
+#confusion matrix 
+
+# days with a low warning level = 1
+pred.logst.3h.test$low <- as.integer(pred.logst.3h.test$prediction.fit <= tl)
+
+
+# days with a medium warning level = 1
+pred.logst.3h.test$med <- as.integer(pred.logst.3h.test$prediction.fit > tl & pred.logst.3h.test$prediction.fit <= tu)
+
+
+# days with a high warning level = 1
+pred.logst.3h.test$high <- as.integer(pred.logst.3h.test$prediction.fit > tu)
+
+
+#initiate confusion matrix data frame 
+
+conf.mat.test <- data.frame(row.names = c("landslide", "no landslide"))
+
+#add data 
+conf.mat.test["landslide", "low"] <- pred.logst.3h.test %>% filter(event == 1) %>% pull(low) %>% sum
+conf.mat.test["no landslide", "low"] <- pred.logst.3h.test %>% filter(event == 0) %>% pull(low) %>% sum
+conf.mat.test["landslide", "med"] <- pred.logst.3h.test %>% filter(event == 1) %>% pull(med) %>% sum
+conf.mat.test["no landslide", "med"] <- pred.logst.3h.test %>% filter(event == 0) %>% pull(med) %>% sum
+conf.mat.test["landslide", "high"] <- pred.logst.3h.test %>% filter(event == 1) %>% pull(high) %>% sum
+conf.mat.test["no landslide", "high"] <- pred.logst.3h.test %>% filter(event == 0) %>% pull(high) %>% sum
+
+
+write.csv(conf.mat.test, paste0(figdir, "confmat_test.csv"))
+
+conf.mat.test
+
+```
+
+
+```{r}
+#calculate precision and recall 
+
+#precision (TP/TP+FP) %of correctly identified landslide days out of test predicted landslide days
+precision.test <- sum(conf.mat.test["landslide", c("med", "high")])/sum(conf.mat.test[,c("med", "high")])
+
+#recall(TP/TP+FN) % of correctly identified landslides days out of test landslide days 
+recall.test <- sum(conf.mat.test["landslide", c("med", "high")])/sum(conf.mat.test["landslide",])
+
+print(precision.test)
+print(recall.test)
+
+```
+
+
+###### Brier Skill Score #######
+
+We compare the skill of the logistic regression model in predicting landslides to a simpler reference model: the historical daily frequency of landslides (the rare event coin toss).
+
+A Brier Score is the mean square error of probability forecasts, in this case landslide (1) or no landslide (0).
+
+$$ BS = 1/N * sum((f_t - o_t)^2) $$
+
+where $f_t$ is the predicted probability and $o_t$ is the actual outcome. 
+
+```{r}
+#compute Brier Scores for each model (lower scores represent better predictions)
+
+#logistic regression 
+
+BS_logst <- (1/nrow(pred.logst.3h.test))*sum(((pred.logst.3h.test$prediction.fit - pred.logst.3h.test$event)^2))
+
+#calculate historical frequency of landsliding in Sitka in the training dataset 
+
+hfreq.train <- mean(id.logit.train$event)
+
+#Historical frequency
+BS_freq <- (1/nrow(pred.logst.3h.test))*sum(((hfreq.train - pred.logst.3h.test$event)^2))
+
+
+```
+
+A Brier Skill Score compares the predictive skill of two models.  
+
+$$ BSS = 1 - (BS/BS_ref) $$
+
+Where a BSS = 0 would mean the models are the same, BSS > 0 means the model outperforms the reference model, and BSS < 0 means the model is worse than the reference model 
+
+```{r}
+#compute Brier Skill Scores comparing the logistic regression to the reference models
+
+#logistic regression compared to historical frequency 
+
+BSS_logst_freq <- 1 - (BS_logst/BS_freq)
+
+print(BSS_logst_freq)
+
+BSS <- data.frame(BS_logst = BS_logst, 
+                  BS_freq = BS_freq, 
+                  BSS = BSS_logst_freq)
+
+write.csv(BSS, paste0(figdir, "brierscores.csv"))
+
+```
+
+Over the course of the test dataset, where do the predictions fall
+
+```{r}
+
+
+plot.2020.ts <- ggplot(data = pred.logst.3h.test, 
+                 aes(x = ymd(day), 
+                     y = prediction.fit)) + 
+             
+             geom_ribbon(aes(ymin = lower95, ymax = upper95), alpha = 0.3, fill = "grey70") +
+            scale_y_log10() +
+            geom_line() + 
+            geom_point(data = pred.logst.3h.test %>% filter(prediction.fit > tl), 
+                       aes(x = ymd(day), y = prediction.fit), 
+                       color = 'darkorange', 
+                       size = 2) +
+            geom_hline(yintercept = tl, linetype = 2, color = "darkorange", size = 0.5) +
+            geom_hline(yintercept = tu, linetype = 2, color = "red", size = 0.5) + 
+            geom_hline(yintercept = hfreq.train, linetype = 3, color = "black", size = 0.5) + 
+         
+            ylab('Predicted Landslide Probability') + 
+            xlab('') + 
+            scale_x_date(limits = as.Date(c("2019-12-01","2020-11-30")), date_breaks = "2 months", date_labels = "%Y-%m-%d") + 
+           
+            theme_bw() + 
+            theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+plot.2020.ts
+
+
+ggsave(filename = paste0(figdir, '2020_timeseries_log.pdf'), 
+        plot = plot.2020.ts, 
+       width = 6.5, 
+       height = 3, 
+       units = ('in'))
+
+
+
+```
+
+
+### Precision Recall Curves ###
+
+
+```{r}
+
+#where is the threshold that maximizes both precision and recall? (best job of predicting landslides while avoiding
+#missed alarms)
+#maximize the f-score to do this
+
+cp_fscore <- cutpointr(pred.logst.3h.all, prediction.fit, event, method = maximize_metric, metric = F1_score)
+
+
+scores <- cp_fscore$roc_curve[[1]] %>%
+          rename(Threshold = x.sorted) %>%
+          mutate(prec = tp/(tp+fp))
+
+
+
+
+```
+
+Make Precision-Recall plots
+
+```{r}
+
+
+plot.prec.recall <- ggplot(scores, 
+                   aes(tpr, prec, color = Threshold)) + 
+                  geom_line(size = 1) + 
+                  geom_point(size = 1.5) +
+                  geom_point(data = tibble(x = 1, y = 0.15),
+                                             mapping = aes(x,y),
+                                             pch = 18,
+                                             color = 'orange', size = 3) +
+                  geom_point(data = tibble(x = 0.6, y = 1),
+                                             mapping = aes(x,y),
+                                             pch = 18,
+                                             color = 'red', size = 3) +
+                  scale_color_scico(palette = 'batlow') + 
+                  ylab('Precision') + 
+                  xlab('Recall') + 
+                  theme_bw() + 
+                  theme(legend.position = 'bottom') 
+
+ggsave(paste0(figdir, "plot_prec_recall.pdf"), 
+       plot.prec.recall, 
+       width = 80, 
+       height = 80, 
+       units = c('mm'))
+
+```
+
+
+

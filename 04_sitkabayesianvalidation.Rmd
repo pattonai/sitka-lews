@@ -1,0 +1,549 @@
+---
+title: "Sitka Bayesian Model Validation"
+author: "Lisa Luna"
+date: "2/1/2022"
+output: html_document
+---
+This notebook performs validation steps for the 3-hourly Bayesian models: BL-3H and BP-3H. It: 
+- performs manual leave-one-out cross validation for the landslide points
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+
+library(brms)
+library(tidybayes)
+library(dplyr)
+#library(modelr)
+library(ggplot2)
+library(tidyr)
+library(loo)
+library(bayesplot)
+library(patchwork)
+library(boot)
+library(dplyr)
+library(tibble)
+library(lubridate)
+library(forcats)
+
+
+```
+
+```{r}
+#where are the landslides in the data table?
+
+lsdat.scaled <- scaled.dat[scaled.dat$event == 1, ]
+
+#add a note which drop this corresponds to
+
+lsdat.scaled <- bind_cols(lsdat.scaled, data.frame(model = as.factor(c("loo1", "loo2", "loo3", "loo4", "loo5"))))
+
+#reorder for plotting
+lsdat.scaled <- lsdat.scaled %>%
+         mutate(model = fct_rev(reorder(model, precip_mm_max3hr)))
+
+
+```
+
+
+```{r, include = FALSE}
+#run the models excluding one landslide point each time
+
+
+#max 3 hr rainfall occurring on that day as predictor
+
+landloo_logst_fits <- list()
+
+for (i in 1:nrow(lsdat.scaled)) {
+  
+  landloo_logst_fits[[i]] <- brm(event ~ precip_mm_max3hr, 
+                     data = scaled.dat[scaled.dat$day != lsdat.scaled[i, 'day'],], 
+                     family = bernoulli(link = "logit"), 
+                     prior = logst_priors,
+                     warmup = 500, 
+                     iter = 2000, 
+                     chains = 4, 
+                     cores = 4)  
+ 
+  }
+
+names(landloo_logst_fits) <- c("loo1", "loo2", "loo3", "loo4", "loo5")
+
+```
+
+
+
+First step, let's look at the posteriors.  
+
+```{r}
+
+landloo_epred_logst_df <- data.frame()
+
+a <- scaled.dat$precip_mm_max3hr
+b <- dat$precip_mm_max3hr
+
+newdata <- data.frame(x = seq(from = min(a), to = max(a), length.out = 100))
+colnames(newdata) <- "precip_mm_max3hr"
+
+for (n in names(landloo_logst_fits)) {
+
+epred_temp <- newdata  %>%
+  
+                  add_epred_draws(landloo_logst_fits[[n]], ndraws = 500) %>%
+                  
+                  mutate_at("precip_mm_max3hr", ~(.*sd(b) + mean(b))) %>%
+              
+                  mutate(model = n) 
+
+landloo_epred_logst_df <- bind_rows(landloo_epred_logst_df, epred_temp)
+
+}
+
+#add draws from complete model 
+
+epred_logst_3h <- newdata %>% 
+                  
+                  add_epred_draws(fit_logst_3h, ndraws = 500) %>%
+  
+                  mutate_at("precip_mm_max3hr", ~(.*sd(b) + mean(b))) %>%
+              
+                  mutate(model = "all") 
+
+
+#bind
+
+landloo_epred_logst_df <- bind_rows(landloo_epred_logst_df, epred_logst_3h)
+
+rm(epred_logst_3h, epred_temp)
+
+
+```
+
+
+
+```{r}
+
+event_loo_df <- dat[c("X", "event", "precip_mm_max3hr")] %>% mutate(model = "all")
+
+for (i in seq(1,5)) {
+  
+event_loo_df <- bind_rows(event_loo_df, dat[dat$day != lsdat.scaled[i, 'day'], c("X", "event", "precip_mm_max3hr")] %>% mutate(model = paste0("loo", i)))  
+
+}
+
+
+```
+
+
+```{r}
+lsdat <- lsdat.scaled[, c("precip_mm_max3hr", "model", "event")] %>%
+  
+          mutate_at("precip_mm_max3hr", ~(.*sd(b) + mean(b)))
+  
+  
+
+fig_post_loo <-  landloo_epred_logst_df %>%
+        
+                ggplot(aes(x = precip_mm_max3hr, y = event)) + 
+                
+                stat_lineribbon(aes(y=.epred), point_interval = median_qi, 
+                                .width = c(0.66, 0.95), size = 0.5, color = 'red') + 
+                
+                scale_fill_brewer() +
+                  
+                geom_point(data = event_loo_df %>% filter(event == 1), pch=21,bg="red",size=1.5) + 
+  
+                geom_point(data = event_loo_df %>% filter(event == 0), size = 1.5, alpha = 0.7) +
+                
+                geom_vline(data = lsdat[, c("precip_mm_max3hr", "model")], mapping = aes(xintercept = precip_mm_max3hr), linetype = 2, color = "black") + 
+  
+                geom_point(data = lsdat, size = 1.5, shape = 1, color = "red") + 
+  
+                facet_wrap(~fct_rev(factor(model, levels = c(levels(lsdat.scaled$model), 'all'))), nrow = 6) + 
+  
+                ylab("P(Landslide Occurrence)") + 
+  
+                xlab("Maximum 3-Hour Precipitation (mm)") + 
+                
+                theme_bw() + 
+  
+                theme(panel.grid.minor.y = element_blank(),
+                      strip.text = element_blank(),
+                      legend.position = "none")
+
+
+plot(fig_post_loo)
+```
+```{r}
+#have a look at the posterior parameter estimates for each of these models and see if they are different...
+
+get_variables(fit_logst_3h)
+
+landloo_bIntercept_logst_df <- data.frame()
+
+for (n in names(landloo_logst_fits)) {
+
+bint_temp <- landloo_logst_fits[[n]]  %>%
+  
+              spread_draws(b_Intercept) %>%
+                  
+                  mutate(model = n) 
+
+landloo_bIntercept_logst_df <- bind_rows(landloo_bIntercept_logst_df, bint_temp)
+
+}
+
+#add draws from complete model 
+
+bint_temp <- fit_logst_3h %>% 
+                  
+                  spread_draws(b_Intercept) %>%
+                  
+                  mutate(model = "all")
+
+landloo_bIntercept_logst_df <- bind_rows(landloo_bIntercept_logst_df, bint_temp)
+
+landloo_bIntercept_logst_df <- landloo_bIntercept_logst_df %>%
+                              mutate(param = 'Intercept') %>%
+                              rename(est = b_Intercept)
+
+landloo_b0_logst_df <- data.frame()
+
+for (n in names(landloo_logst_fits)) {
+
+b0_temp <- landloo_logst_fits[[n]]  %>%
+  
+              spread_draws(b_precip_mm_max3hr) %>%
+                  
+                  mutate(model = n) 
+
+landloo_b0_logst_df <- bind_rows(landloo_b0_logst_df, b0_temp)
+
+}
+
+#add draws from complete model 
+
+b0_temp <- fit_logst_3h %>% 
+                  
+                  spread_draws(b_precip_mm_max3hr) %>%
+                  
+                  mutate(model = "all")
+
+landloo_b0_logst_df <- bind_rows(landloo_b0_logst_df, b0_temp)
+
+landloo_b0_logst_df <- landloo_b0_logst_df %>%
+                      mutate(param = 'Slope') %>%
+                      rename(est = b_precip_mm_max3hr)
+
+landloo_param_logst_df <- bind_rows(landloo_bIntercept_logst_df, landloo_b0_logst_df)
+
+
+```
+
+```{r}
+plot_loo_logst_params <- landloo_param_logst_df %>%
+                        ggplot(aes(x = est, 
+                                   y = factor(model, levels = c(levels(lsdat.scaled$model), 'all')))) + 
+                          stat_halfeye() + 
+                          facet_wrap(~param, scales = 'free_x') +
+                          xlab('Posterior parameter estimate') + 
+                              theme_bw() + 
+                              theme(panel.background = element_rect(fill = NA, color = 'black'),
+                             #strip.text = element_blank(),
+                             strip.background = element_rect(fill = NA, color = NA),
+                              #axis.title.x = element_blank(),
+                             strip.text.x = element_text(size = 12),
+                              axis.title.y = element_blank(),
+                              axis.text.y = element_blank(), 
+                              axis.ticks.y = element_blank()) 
+
+plot_loo_logst_params
+```
+
+### Repeat the excercise with Poisson regression ###
+
+
+```{r, include = FALSE}
+#run the Poisson models excluding one landslide point each time
+
+#max 3 hr rainfall occurring on that day as predictor
+
+landloo_pois_fits <- list()
+
+for (i in 1:nrow(lsdat.scaled)) {
+  
+  landloo_pois_fits[[i]] <- brm(lscount ~ precip_mm_max3hr, 
+                     data = scaled.dat[scaled.dat$day != lsdat.scaled[i, 'day'],], 
+                     family = poisson(link = "log"), 
+                     prior = pois_priors,
+                     warmup = 500, 
+                     iter = 2000, 
+                     chains = 4, 
+                     cores = 4)  
+ 
+  }
+
+names(landloo_pois_fits) <- c("loo1", "loo2", "loo3", "loo4", "loo5")
+
+```
+
+
+First step, let's look at the posteriors.  
+
+```{r}
+
+landloo_epred_pois_df <- data.frame()
+
+a <- scaled.dat$precip_mm_max3hr
+b <- dat$precip_mm_max3hr
+
+newdata <- data.frame(x = seq(from = min(a), to = max(a), length.out = 100))
+colnames(newdata) <- "precip_mm_max3hr"
+
+for (n in names(landloo_pois_fits)) {
+
+epred_temp <- newdata  %>%
+  
+                  add_epred_draws(landloo_pois_fits[[n]], ndraws = 500) %>%
+                  
+                  mutate_at("precip_mm_max3hr", ~(.*sd(b) + mean(b))) %>%
+              
+                  mutate(model = n) 
+
+landloo_epred_pois_df <- bind_rows(landloo_epred_pois_df, epred_temp)
+
+}
+
+#add draws from complete model 
+
+epred_pois_3h <- newdata %>% 
+                  
+                  add_epred_draws(fit_pois_3h, ndraws = 500) %>%
+  
+                  mutate_at("precip_mm_max3hr", ~(.*sd(b) + mean(b))) %>%
+              
+                  mutate(model = "all") 
+
+
+#bind
+
+landloo_epred_pois_df <- bind_rows(landloo_epred_pois_df, epred_pois_3h)
+
+rm(epred_pois_3h, epred_temp)
+
+
+```
+
+
+
+```{r}
+
+lscount_loo_df <- dat[c("X", "lscount", "precip_mm_max3hr")] %>% mutate(model = "all")
+
+for (i in seq(1,5)) {
+  
+lscount_loo_df <- bind_rows(lscount_loo_df, dat[dat$day != lsdat.scaled[i, 'day'], c("X", "lscount", "precip_mm_max3hr")] %>% mutate(model = paste0("loo", i)))  
+
+}
+
+
+```
+
+
+```{r}
+lsdat <- lsdat.scaled[, c("precip_mm_max3hr", "model", "lscount")] %>%
+  
+          mutate_at("precip_mm_max3hr", ~(.*sd(b) + mean(b)))
+  
+  
+
+fig_post_loo_pois <-  landloo_epred_pois_df %>%
+        
+                ggplot(aes(x = precip_mm_max3hr, y = lscount)) + 
+                
+                stat_lineribbon(aes(y=.epred), point_interval = median_qi, 
+                                .width = c(0.66, 0.95), size = 0.5, color = 'red') + 
+                
+                scale_fill_brewer() +
+                  
+                geom_point(data = lscount_loo_df %>% filter(lscount > 0), pch=21,bg="red",size=1.5) + 
+  
+                geom_point(data = lscount_loo_df %>% filter(lscount == 0), size = 1.5, alpha = 0.7) +
+                
+                geom_vline(data = lsdat[, c("precip_mm_max3hr", "model")], mapping = aes(xintercept = precip_mm_max3hr), linetype = 2, color = "black") + 
+  
+                geom_point(data = lsdat, size = 1.5, shape = 1, color = "red") + 
+  
+                facet_wrap(~fct_rev(factor(model, levels = c(levels(lsdat.scaled$model), 'all'))), nrow = 6) + 
+  
+                ylab("Number of landslides") + 
+  
+                xlab("Maximum 3-Hour Precipitation (mm)") + 
+        
+                coord_cartesian(ylim = c(0,10)) + 
+        
+                theme_bw() + 
+  
+                theme(panel.grid.minor.y = element_blank(),
+                      strip.text = element_blank(),
+                      legend.position = "none")
+
+
+plot(fig_post_loo_pois)
+```
+
+
+
+
+
+```{r}
+#we should have a look at the posterior parameter estimates for each of these models and see if they are different...
+
+get_variables(fit_pois_3h)
+
+landloo_bIntercept_pois_df <- data.frame()
+
+for (n in names(landloo_pois_fits)) {
+
+bint_temp <- landloo_pois_fits[[n]]  %>%
+  
+              spread_draws(b_Intercept) %>%
+                  
+                  mutate(model = n) 
+
+landloo_bIntercept_pois_df <- bind_rows(landloo_bIntercept_pois_df, bint_temp)
+
+}
+
+#add draws from complete model 
+
+bint_temp <- fit_pois_3h %>% 
+                  
+                  spread_draws(b_Intercept) %>%
+                  
+                  mutate(model = "all")
+
+landloo_bIntercept_pois_df <- bind_rows(landloo_bIntercept_pois_df, bint_temp)
+
+landloo_bIntercept_pois_df <- landloo_bIntercept_pois_df %>%
+                              mutate(param = 'Intercept') %>%
+                              rename(est = b_Intercept)
+
+landloo_b0_pois_df <- data.frame()
+
+for (n in names(landloo_pois_fits)) {
+
+b0_temp <- landloo_pois_fits[[n]]  %>%
+  
+              spread_draws(b_precip_mm_max3hr) %>%
+                  
+                  mutate(model = n) 
+
+landloo_b0_pois_df <- bind_rows(landloo_b0_pois_df, b0_temp)
+
+}
+
+#add draws from complete model 
+
+b0_temp <- fit_pois_3h %>% 
+                  
+                  spread_draws(b_precip_mm_max3hr) %>%
+                  
+                  mutate(model = "all")
+
+landloo_b0_pois_df <- bind_rows(landloo_b0_pois_df, b0_temp)
+
+landloo_b0_pois_df <- landloo_b0_pois_df %>%
+                      mutate(param = 'Slope') %>%
+                      rename(est = b_precip_mm_max3hr)
+
+landloo_param_pois_df <- bind_rows(landloo_bIntercept_pois_df, landloo_b0_pois_df)
+
+
+```
+
+
+```{r}
+plot_loo_pois_params <- landloo_param_pois_df %>%
+                        ggplot(aes(x = est, 
+                                   y = factor(model, levels = c(levels(lsdat.scaled$model), 'all')))) + 
+                          stat_halfeye() + 
+                          facet_wrap(~param, scales = 'free_x') +
+                          xlab('Posterior parameter estimate') + 
+                              theme_bw() + 
+                              theme(panel.background = element_rect(fill = NA, color = 'black'),
+                             #strip.text = element_blank(),
+                             strip.background = element_rect(fill = NA, color = NA),
+                              #axis.title.x = element_blank(),
+                             strip.text.x = element_text(size = 12),
+                              axis.title.y = element_blank(),
+                              axis.text.y = element_blank(), 
+                              axis.ticks.y = element_blank()) 
+
+plot_loo_pois_params
+```
+
+
+
+```{r}
+#assemble and save
+
+loo_fig <- fig_post_loo + fig_post_loo_pois
+
+loo_posts <- plot_loo_logst_params + plot_loo_pois_params
+
+
+ggsave(filename = paste0(figdir, 'loo_posteriors.png'),
+       plot = loo_fig,
+       #device = pdf,
+       width = 190,
+       height = 150,
+       units = 'mm',
+       dpi = 400)
+
+
+ggsave(filename = paste0(figdir, 'loo_posteriors.pdf'),
+       plot = loo_fig,
+       #device = pdf,
+       width = 190,
+       height = 150,
+       units = 'mm')
+
+p1 = fig_post_loo/plot_loo_logst_params   
+p2 = fig_post_loo_pois/plot_loo_pois_params
+
+total_loo_fig = p1 | p2
+
+total_loo_fig = total_loo_fig + plot_layout(heights = c(3,1)) + plot_annotation(tag_levels = 'A')
+
+total_loo_fig
+
+
+
+ggsave(filename = paste0(figdir, 'loo_posteriors.png'),
+       plot = total_loo_fig,
+       #device = pdf,
+       width = 190,
+       height = 210,
+       units = 'mm',
+       dpi = 400)
+
+
+ggsave(filename = paste0(figdir, 'loo_posteriors.pdf'),
+       plot = total_loo_fig,
+       #device = pdf,
+       width = 190,
+       height = 210,
+       units = 'mm')
+
+```
+
+
+
+
+
+
+
