@@ -1,3 +1,6 @@
+[![DOI](https://zenodo.org/badge/585719396.svg)](https://zenodo.org/badge/latestdoi/585719396)
+
+
 # sitka_lews
 
 ## Data and files related to the manuscript submitted to NHESS 
